@@ -2,6 +2,10 @@
   "routerSSH": "mt6000-lan",
   "expectedHostname": "your-router-hostname",
   "retentionDays": 30,
+  "deviceNames": {
+    "02:00:00:00:00:01": "自定义设备名称"
+  },
+  "addressBindings": [],
   "applications": [
     {
       "id": "private-emby",

@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const state = {range:'today', device:'', application:'', data:null, request:0};
+const state = {range:'today', device:'', application:'', offset:0, showInactive:false, data:null, request:0, controller:null};
 const fmt = bytes => {
   if (!Number.isFinite(bytes)) return '—';
   const units = ['B','KiB','MiB','GiB','TiB'];
@@ -29,14 +29,21 @@ async function refresh() {
   if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||end-start>90*86400000){showNotice('请选择不超过 90 天的有效日期范围。');return;}
   const params=new URLSearchParams({start:String(start),end:String(end)});
   if(state.device)params.set('device',state.device);
+  if(state.application)params.set('application',state.application);
+  params.set('offset',String(state.offset));params.set('limit','50');
+  state.controller?.abort();const controller=new AbortController();state.controller=controller;
+  const timeout=setTimeout(()=>controller.abort(),15000);
+  $('domainPrevious').disabled=$('domainNext').disabled=true;
   try{
-    const response=await fetch(`/api/home/summary?${params}`,{cache:'no-store',signal:AbortSignal.timeout(15000)});
+    const response=await fetch(`/api/home/summary?${params}`,{cache:'no-store',signal:controller.signal});
     if(response.status===401){location.assign('/login');return;}
     if(!response.ok)throw new Error('暂时无法读取统计，请稍后刷新。');
     const data=await response.json();
     if(serial!==state.request)return;
-    state.data=data;render(data);
-  }catch(error){if(serial===state.request){showNotice(error.message||'暂时无法读取统计。');$('status').textContent='连接中断';$('status').classList.add('stale');}}
+    if(state.offset>0&&state.offset>=data.domainCount){state.offset=0;refresh();return;}
+    state.data=data;render(data);document.body.dataset.renderedRequest=String(serial);
+  }catch(error){if(serial===state.request){showNotice(error.name==='AbortError'?'读取统计超时，请稍后刷新。':error.message||'暂时无法读取统计。');$('status').textContent='连接中断';$('status').classList.add('stale');}}
+  finally{clearTimeout(timeout);if(state.controller===controller)state.controller=null;}
 }
 function showNotice(text){$('notice').textContent=text;$('notice').hidden=!text;}
 function deviceSymbol(name){const n=name.toLowerCase();if(n.includes('tv')||n.includes('电视'))return '▣';if(n.includes('watch'))return '◷';if(n.includes('phone'))return '▯';if(n.includes('ipad'))return '▯';if(n.includes('camera'))return '◉';if(n.includes('mac'))return '▱';if(n.includes('router')||n.includes('路由器'))return '⌘';return '◇';}
@@ -54,9 +61,21 @@ function render(data) {
   $('downloadDetail').textContent=state.device?'所选设备的采样用量':`当前全屋下行 ${fmt(fresh?data.downloadRate:0)}/s`;
   $('uploadDetail').textContent=state.device?'所选设备的采样用量':`当前全屋上行 ${fmt(fresh?data.uploadRate:0)}/s`;
   $('totalDetail').textContent=state.device?'设备用量按连接采样统计':'总量含未归属的短连接用量';
+  const unknown=data.applications.find(a=>a.id==='unknown')?.total||0;
+  const percent=bytes=>data.totals.total?`${(bytes/data.totals.total*100).toFixed(2)}%`:'0%';
+  $('classification').textContent=`未识别服务 ${fmt(unknown)}（${percent(unknown)}）${state.device?'':` · 未采样到连接明细 ${fmt(data.unattributed.total)}（${percent(data.unattributed.total)}）`}`;
   showNotice([data.collectionError,data.inventoryError].filter(Boolean).join('；'));
+  renderDevices(data);
+  renderApplications(data);renderDomains(data);renderChart(data);
+  $('coverage').textContent=`统计包含 sing-box 接管的直连和代理流量，保留近 ${data.retentionDays} 天记录。${!state.device&&data.unattributed.total>0?'本时段另有 '+fmt(data.unattributed.total)+' 未归属到设备或域名（包括采样间隔内结束的短连接）。':''}`;
+}
+function renderDevices(data){
+  const knownDevices=data.devices.filter(d=>d.mac);
+  const inactive=data.devices.filter(d=>d.total===0&&d.id!==state.device).length;
+  $('inactiveCount').textContent=String(inactive);
   const body=$('devices');body.replaceChildren();
-  for(const d of data.devices){
+  const visible=data.devices.filter(d=>state.showInactive||d.total>0||d.id===state.device);
+  for(const d of visible){
     const row=node('tr');row.classList.toggle('selected',d.id===state.device);
     const identity=node('td'),wrap=node('div',undefined,'device-name'),text=node('div');
     wrap.append(node('span',deviceSymbol(d.name),'device-symbol'));
@@ -68,33 +87,36 @@ function render(data) {
     const du=node('td',undefined,'du');du.append(node('div',`↓ ${fmt(d.download)}`),node('div',`↑ ${fmt(d.upload)}`,'up'));
     row.append(identity,du,node('td',fmt(d.total)));body.append(row);
   }
-  if(!data.devices.length){const row=node('tr'),cell=node('td','等待设备信息与流量采样','empty');cell.colSpan=3;row.append(cell);body.append(row);}
+  if(!visible.length){const row=node('tr'),cell=node('td','此时段没有设备流量，可勾选显示零用量设备','empty');cell.colSpan=3;row.append(cell);body.append(row);}
   $('deviceBadge').textContent=String(knownDevices.length);
-  renderApplications(data);renderDomains(data);renderChart(data);
-  $('coverage').textContent=`统计包含 sing-box 接管的直连和代理流量，保留近 ${data.retentionDays} 天记录。${!state.device&&data.unattributed.total>0?'本时段另有 '+fmt(data.unattributed.total)+' 未归属到设备或域名（包括采样间隔内结束的短连接）。':''}`;
 }
-function selectDevice(id){state.device=id;state.application='';refresh();}
+function selectDevice(id){state.device=id;state.application='';state.offset=0;refresh();}
 function renderApplications(data){
   const container=$('applications');container.replaceChildren();
   $('applicationBadge').textContent=String(data.applications.length);
   const maximum=Math.max(1,...data.applications.map(a=>a.total));
   for(const app of data.applications){
-    const button=node('button',undefined,'app-button');button.type='button';button.classList.toggle('selected',app.name===state.application);
+    const button=node('button',undefined,'app-button');button.type='button';button.dataset.application=app.id;button.classList.toggle('selected',app.id===state.application);button.setAttribute('aria-pressed',String(app.id===state.application));
     const row=node('div',undefined,'app-row');row.append(node('span',app.name,'app-name'),node('span',fmt(app.total),'app-volume'));
     const track=node('div',undefined,'app-track'),fill=node('div',undefined,'app-fill');fill.style.width=`${Math.max(0.5,app.total/maximum*100)}%`;track.append(fill);
     button.append(row,track);
     if(app.tunnel)button.append(node('p','若设备自行代理，隧道内的具体 App 无法识别','app-caption'));
-    button.addEventListener('click',()=>{state.application=state.application===app.name?'':app.name;renderApplications(state.data);renderDomains(state.data);});
+    if(app.description)button.append(node('p',app.description,'app-caption'));
+    button.addEventListener('click',()=>{state.application=state.application===app.id?'':app.id;state.offset=0;refresh();});
     container.append(button);
   }
   if(!data.applications.length)container.append(node('p','此时间范围尚无流量记录。首次采集前的历史无法追溯。','empty'));
 }
 function renderDomains(data){
-  $('domainTitle').textContent=state.application?`目标域名 · ${state.application}`:'目标域名';$('clearApp').hidden=!state.application;
+  const app=data.applications.find(a=>a.id===state.application);
+  $('domainTitle').textContent=state.application?`目标域名 · ${app?.name||state.application}`:'目标域名';$('clearApp').hidden=!state.application;
   const body=$('domains');body.replaceChildren();
-  const domains=data.domains.filter(d=>!state.application||d.application===state.application);
-  for(const d of domains){const row=node('tr');row.append(node('td',d.host),node('td',d.deviceName),node('td',d.application),node('td',fmt(d.total)));body.append(row);}
+  const domains=data.domains;
+  for(const d of domains){const row=node('tr'),service=node('td',d.application);if(d.description)service.title=d.description;row.append(node('td',d.host),node('td',d.deviceName),service,node('td',fmt(d.total)));body.append(row);}
   if(!domains.length){const row=node('tr'),cell=node('td','此时间范围没有对应的域名记录','empty');cell.colSpan=4;row.append(cell);body.append(row);}
+  $('domainPage').textContent=`${domains.length?data.domainOffset+1:0}–${data.domainOffset+domains.length} / ${data.domainCount} 条 · 筛选合计 ${fmt(data.domainUsage.total)}`;
+  $('domainPrevious').disabled=data.domainOffset===0;
+  $('domainNext').disabled=data.domainOffset+domains.length>=data.domainCount;
 }
 function renderChart(data){
   const container=$('chart');container.replaceChildren();
@@ -124,13 +146,16 @@ function renderChart(data){
 }
 document.querySelectorAll('[data-range]').forEach(button=>button.addEventListener('click',()=>{
   state.range=button.dataset.range;document.querySelectorAll('[data-range]').forEach(b=>b.classList.toggle('active',b===button));
-  $('customRange').hidden=state.range!=='custom';state.application='';if(state.range!=='custom')refresh();
+  $('customRange').hidden=state.range!=='custom';state.application='';state.offset=0;if(state.range!=='custom')refresh();
 }));
-$('customRange').addEventListener('submit',event=>{event.preventDefault();refresh();});
+$('customRange').addEventListener('submit',event=>{event.preventDefault();state.offset=0;refresh();});
 $('allDevices').addEventListener('click',()=>selectDevice(''));
-$('clearApp').addEventListener('click',()=>{state.application='';renderApplications(state.data);renderDomains(state.data);});
+$('clearApp').addEventListener('click',()=>{state.application='';state.offset=0;refresh();});
+$('showInactive').addEventListener('change',event=>{state.showInactive=event.target.checked;if(state.data)renderDevices(state.data);});
+$('domainPrevious').addEventListener('click',()=>{state.offset=Math.max(0,state.offset-50);refresh();});
+$('domainNext').addEventListener('click',()=>{state.offset+=50;refresh();});
 $('refresh').addEventListener('click',refresh);
 $('startDate').value=$('endDate').value=dayValue(new Date());
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});
-setInterval(()=>{if(!document.hidden)refresh();},5000);
+setInterval(()=>{if(!document.hidden&&!state.controller)refresh();},5000);
 refresh();

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -286,5 +287,138 @@ func TestHomeConfigRejectsInvalidCatalogue(t *testing.T) {
 	}
 	if _, err := newHomeMonitor(s.db, s.cfg); err == nil {
 		t.Fatal("invalid classifier regexp accepted")
+	}
+}
+
+func TestHomeDomainClassificationKeepsSeparateUsage(t *testing.T) {
+	s := newTestHomeService(t)
+	base := int64(1800000000000)
+	insertTestAggregates(t, s.db, []aggregatedEntry{
+		{BucketStart: base, BucketEnd: base + 60000, SourceIP: "192.0.2.2", Host: "unlisted.example", RuleGroup: "final", Chains: `[]`, Download: 10, Count: 1},
+		{BucketStart: base + 60000, BucketEnd: base + 120000, SourceIP: "192.0.2.2", Host: "unlisted.example", RuleGroup: "rule_set=GitHub-telegram => route(proxy)", Chains: `[]`, Download: 90, Count: 1},
+	})
+	got, err := s.home.summary(base, base+120000, "")
+	if err != nil || len(got.Domains) != 2 {
+		t.Fatalf("different classifications were combined: %+v, %v", got.Domains, err)
+	}
+	for _, app := range got.Applications {
+		var total int64
+		for _, domain := range got.Domains {
+			if domain.Application == app.Name {
+				total += domain.Total
+			}
+		}
+		if total != app.Total {
+			t.Errorf("%s: domains=%d application=%d", app.Name, total, app.Total)
+		}
+	}
+}
+
+func TestHomeApplicationFilterPrecedesDomainPagination(t *testing.T) {
+	s := newTestHomeService(t)
+	base := int64(1800000000000)
+	entries := make([]aggregatedEntry, 0, 202)
+	for i := 0; i < 201; i++ {
+		entries = append(entries, aggregatedEntry{BucketStart: base, BucketEnd: base + 60000, SourceIP: "192.0.2.2", Host: fmt.Sprintf("%03d.example", i), Chains: `[]`, Download: 1000, Count: 1})
+	}
+	entries = append(entries, aggregatedEntry{BucketStart: base, BucketEnd: base + 60000, SourceIP: "192.0.2.2", Host: "api.openai.com", Chains: `[]`, Download: 1, Count: 1})
+	insertTestAggregates(t, s.db, entries)
+	s.home.accessToken = ""
+	for _, tc := range []struct {
+		query       string
+		count, rows int
+		first       string
+	}{
+		{"application=openai&limit=50", 1, 1, "api.openai.com"},
+		{"offset=200&limit=50", 202, 2, "200.example"},
+		{"application=missing&limit=50", 0, 0, ""},
+	} {
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/home/summary?start=%d&end=%d&%s", base, base+60000, tc.query), nil))
+		var got struct {
+			Domains     []homeDomain `json:"domains"`
+			DomainCount int          `json:"domainCount"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || rec.Code != http.StatusOK || got.DomainCount != tc.count || len(got.Domains) != tc.rows {
+			t.Fatalf("%s: status=%d count=%d rows=%d (%v)", tc.query, rec.Code, got.DomainCount, len(got.Domains), err)
+		}
+		if tc.first != "" && got.Domains[0].Host != tc.first {
+			t.Errorf("%s: first domain=%s", tc.query, got.Domains[0].Host)
+		}
+	}
+}
+
+func TestHomeExplicitAddressCorrectionsPreserveObservedOwners(t *testing.T) {
+	s := newTestHomeService(t)
+	base := int64(1800000000000)
+	first, second := "aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"
+	s.home.config.DeviceNames = map[string]string{first: "Named device"}
+	s.home.config.AddressBindings = []homeAddress{{Address: "2001:db8::2", Device: first, From: base, To: base + 120000}}
+	if err := s.home.storeInventory(homeInventory{ObservedAt: base + 60000, Neighbors: "2001:db8::2 dev br-lan lladdr " + second + " REACHABLE"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		ts := base + int64(i)*60000
+		insertTestAggregates(t, s.db, []aggregatedEntry{{BucketStart: ts, BucketEnd: ts + 60000, SourceIP: "2001:db8::2", Host: "example.com", Chains: `[]`, Download: 100, Count: 1}})
+	}
+	got, err := s.home.summary(base, base+180000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := map[string]int64{}
+	for _, d := range got.Devices {
+		usage[d.ID] = d.Total
+		if d.ID == first && (d.Name != "Named device" || d.MAC != first) {
+			t.Fatalf("device annotation missing: %+v", d)
+		}
+	}
+	if usage[first] != 100 || usage[second] != 200 {
+		t.Fatalf("observed ownership was overwritten: %+v", usage)
+	}
+}
+
+func TestHomeCatalogueRecognizesServicesAndCIDRBoundaries(t *testing.T) {
+	s := newTestHomeService(t)
+	for _, tc := range []struct{ host, want string }{
+		{"91.108.56.185", "telegram"}, {"149.154.175.57", "telegram"}, {"2001:b28:f23d::1", "telegram"},
+		{"149.154.159.255", "unknown"}, {"api.deepseek.com", "deepseek"},
+		{"v1.fqnovelvod.com", "fqnovel"}, {"dns.alidns.com", "encrypted-dns"},
+		{"img.cloud.ottcn.com", "cctv"}, {"bucket.oss-accelerate.aliyuncs.com", "cloud-storage"},
+		{"bucket.oss-accelerate.aliyuncs.com.evil.test", "unknown"},
+	} {
+		if got := s.home.classify(tc.host, "final"); got.ID != tc.want {
+			t.Errorf("%s: %s, want %s", tc.host, got.ID, tc.want)
+		}
+	}
+	if got := s.home.classify("91.108.56.185", "rule_set=GitHub-youtube => route(proxy)"); got.ID != "youtube" {
+		t.Fatalf("CIDR overrode observed rule: %+v", got)
+	}
+}
+
+func TestHomeRejectsInvalidDomainPagination(t *testing.T) {
+	s := newTestHomeService(t)
+	for _, query := range []string{"offset=-1", "offset=no", "limit=0", "limit=201", "limit=no", "offset=999999999999999999999999"} {
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/home/summary?start=1000&end=2000&"+query, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s returned %d", query, rec.Code)
+		}
+	}
+}
+
+func TestHomeRejectsInvalidAddressAndIPRules(t *testing.T) {
+	for _, body := range []string{
+		`{"deviceNames":{"not-a-mac":"Name"}}`,
+		`{"addressBindings":[{"address":"2001:db8::2","device":"aa:bb:cc:dd:ee:01","from":1000,"to":0}]}`,
+		`{"addressBindings":[{"address":"2001:db8::2","device":"aa:bb:cc:dd:ee:01","from":1000,"to":2000},{"address":"2001:db8::2","device":"aa:bb:cc:dd:ee:02","from":1500,"to":2500}]}`,
+		`{"applications":[{"id":"custom","name":"Custom","ipCIDRs":["bad-prefix"]}]}`,
+	} {
+		s := newTestHomeService(t)
+		if err := os.WriteFile(s.cfg.HomeConfig, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := newHomeMonitor(s.db, s.cfg); err == nil {
+			t.Errorf("invalid config accepted: %s", body)
+		}
 	}
 }

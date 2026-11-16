@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,23 +36,33 @@ type homeConfig struct {
 	InventoryFile    string                `json:"inventoryFile"`
 	RetentionDays    int                   `json:"retentionDays"`
 	Applications     []homeApplicationSpec `json:"applications"`
+	DeviceNames      map[string]string     `json:"deviceNames,omitempty"`
+	AddressBindings  []homeAddress         `json:"addressBindings,omitempty"`
 }
 
 type homeApplicationSpec struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Domains  []string `json:"domains,omitempty"`
-	Suffixes []string `json:"suffixes,omitempty"`
-	Keywords []string `json:"keywords,omitempty"`
-	Regex    []string `json:"regex,omitempty"`
-	RuleSets []string `json:"ruleSets,omitempty"`
-	Tunnel   bool     `json:"tunnel,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Domains     []string `json:"domains,omitempty"`
+	Suffixes    []string `json:"suffixes,omitempty"`
+	Keywords    []string `json:"keywords,omitempty"`
+	Regex       []string `json:"regex,omitempty"`
+	RuleSets    []string `json:"ruleSets,omitempty"`
+	Tunnel      bool     `json:"tunnel,omitempty"`
+	Description string   `json:"description,omitempty"`
+	IPCIDRs     []string `json:"ipCIDRs,omitempty"`
 }
 
 type homeApp struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Tunnel bool   `json:"tunnel,omitempty"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Tunnel      bool   `json:"tunnel,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type homeIPRule struct {
+	prefix netip.Prefix
+	app    homeApp
 }
 
 type homePattern struct {
@@ -69,6 +80,7 @@ type homeMonitor struct {
 	suffix          map[string]homeApp
 	rules           map[string]homeApp
 	patterns        []homePattern
+	ipRules         []homeIPRule
 	ready           bool
 	connections     map[string]connection
 	previousUp      int64
@@ -126,10 +138,12 @@ type homeDevice struct {
 }
 
 type homeDomain struct {
-	Host        string `json:"host"`
-	Device      string `json:"device"`
-	DeviceName  string `json:"deviceName"`
-	Application string `json:"application"`
+	Host          string `json:"host"`
+	Device        string `json:"device"`
+	DeviceName    string `json:"deviceName"`
+	Application   string `json:"application"`
+	ApplicationID string `json:"applicationId"`
+	Description   string `json:"description,omitempty"`
 	homeUsage
 }
 
@@ -158,6 +172,15 @@ type homeSummary struct {
 	Applications    []homeAppUsage `json:"applications"`
 	Domains         []homeDomain   `json:"domains"`
 	Timeline        []homePoint    `json:"timeline"`
+	DomainCount     int            `json:"domainCount"`
+	DomainOffset    int            `json:"domainOffset"`
+	DomainLimit     int            `json:"domainLimit"`
+	DomainUsage     homeUsage      `json:"domainUsage"`
+}
+
+type homeDomainQuery struct {
+	Application   string
+	Offset, Limit int
 }
 
 func newHomeMonitor(db *sql.DB, cfg config) (*homeMonitor, error) {
@@ -180,6 +203,25 @@ func newHomeMonitor(db *sql.DB, cfg config) (*homeMonitor, error) {
 	}
 	if hc.InventoryFile != "" && !filepath.IsAbs(hc.InventoryFile) {
 		hc.InventoryFile = filepath.Join(filepath.Dir(cfg.HomeConfig), hc.InventoryFile)
+	}
+	for key, name := range hc.DeviceNames {
+		if mac, err := net.ParseMAC(key); err != nil || mac.String() != key || strings.TrimSpace(name) == "" {
+			return nil, errors.New("deviceNames requires canonical MAC addresses and non-empty names")
+		}
+	}
+	for i := range hc.AddressBindings {
+		binding := &hc.AddressBindings[i]
+		ip := net.ParseIP(binding.Address)
+		mac, err := net.ParseMAC(binding.Device)
+		if ip == nil || (binding.Device != "router" && (err != nil || mac.String() != binding.Device)) || binding.From <= 0 || binding.To <= binding.From {
+			return nil, errors.New("addressBindings requires an IP, canonical device MAC (or router), and a finite from/to interval in Unix milliseconds")
+		}
+		binding.Address = ip.String()
+		for _, previous := range hc.AddressBindings[:i] {
+			if previous.Address == binding.Address && previous.From < binding.To && binding.From < previous.To {
+				return nil, errors.New("addressBindings intervals for an address must not overlap")
+			}
+		}
 	}
 	h := &homeMonitor{
 		db: db, config: hc, accessToken: getenv("TRAFFIC_MONITOR_ACCESS_TOKEN", cfg.MihomoSecret),
@@ -228,7 +270,14 @@ func (h *homeMonitor) addApplication(spec homeApplicationSpec) error {
 	if spec.ID == "" || spec.Name == "" {
 		return errors.New("application id and name are required")
 	}
-	app := homeApp{spec.ID, spec.Name, spec.Tunnel}
+	app := homeApp{ID: spec.ID, Name: spec.Name, Tunnel: spec.Tunnel, Description: spec.Description}
+	for _, cidr := range spec.IPCIDRs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return fmt.Errorf("application %s: invalid IP prefix: %w", spec.ID, err)
+		}
+		h.ipRules = append(h.ipRules, homeIPRule{prefix.Masked(), app})
+	}
 	for _, domain := range spec.Domains {
 		if key := cleanHomeHost(domain); key != "" {
 			if _, exists := h.exact[key]; !exists {
@@ -296,7 +345,19 @@ func (h *homeMonitor) classify(host, rule string) homeApp {
 			return app
 		}
 	}
-	return homeApp{ID: "unknown", Name: "未识别服务"}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		var match *homeIPRule
+		for i := range h.ipRules {
+			rule := &h.ipRules[i]
+			if rule.prefix.Contains(ip.Unmap()) && (match == nil || rule.prefix.Bits() > match.prefix.Bits()) {
+				match = rule
+			}
+		}
+		if match != nil {
+			return match.app
+		}
+	}
+	return homeApp{ID: "unknown", Name: "未识别服务", Description: "尚未匹配服务规则；裸 IP 或共享基础设施可能无法确定具体 App"}
 }
 
 // Home mode never changes proxy settings. A single transaction stores observed
@@ -547,6 +608,10 @@ func (h *homeMonitor) storeInventory(inventory homeInventory) error {
 }
 
 func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, error) {
+	return h.summaryPage(start, end, selected, homeDomainQuery{Limit: 100})
+}
+
+func (h *homeMonitor) summaryPage(start, end int64, selected string, query homeDomainQuery) (homeSummary, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	out := homeSummary{Start: start, End: end, GeneratedAt: time.Now().UnixMilli(), LastSample: h.lastSample,
@@ -554,6 +619,7 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 		UploadRate: h.uploadRate, DownloadRate: h.downloadRate, Resets: h.resets,
 		RetentionDays: h.config.RetentionDays,
 		Devices:       []homeDevice{}, Applications: []homeAppUsage{}, Domains: []homeDomain{}, Timeline: []homePoint{}}
+	out.DomainOffset, out.DomainLimit = query.Offset, query.Limit
 	_ = h.db.QueryRow(`SELECT value FROM home_metadata WHERE key='collected_since'`).Scan(&out.CollectedSince)
 	devices := map[string]*homeDevice{}
 	rows, err := h.db.Query(`SELECT id,name,mac,last_seen FROM home_devices`)
@@ -566,7 +632,7 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 			rows.Close()
 			return out, err
 		}
-		d.Name = firstNonEmpty(d.Name, "未命名设备 · "+d.ID)
+		d.Name = firstNonEmpty(h.config.DeviceNames[d.ID], d.Name, "未命名设备 · "+d.ID)
 		devices[d.ID] = d
 	}
 	if err := rows.Close(); err != nil {
@@ -601,6 +667,12 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 				return binding.Device
 			}
 		}
+		// Explicit, time-bounded corrections only fill gaps; observed ownership wins.
+		for _, binding := range h.config.AddressBindings {
+			if binding.Address == address && timestamp >= binding.From && timestamp < binding.To {
+				return binding.Device
+			}
+		}
 		return "ip:" + address
 	}
 	appTotals := map[string]*homeAppUsage{}
@@ -626,7 +698,11 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 		id := resolve(source, timestamp)
 		d := devices[id]
 		if d == nil {
-			d = &homeDevice{ID: id, Name: "未归属地址 · " + source, Addresses: []string{source}, Applications: []homeAppUsage{}}
+			name := firstNonEmpty(h.config.DeviceNames[id], "未归属地址 · "+source)
+			d = &homeDevice{ID: id, Name: name, Addresses: []string{source}, Applications: []homeAppUsage{}}
+			if mac, err := net.ParseMAC(id); err == nil {
+				d.MAC = mac.String()
+			}
 			devices[id] = d
 		}
 		d.homeUsage.add(up, down)
@@ -646,9 +722,9 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 			appTotals[app.ID] = &homeAppUsage{homeApp: app}
 		}
 		appTotals[app.ID].homeUsage.add(up, down)
-		key := id + "\x00" + host
+		key := id + "\x00" + host + "\x00" + app.ID
 		if domains[key] == nil {
-			domains[key] = &homeDomain{Host: host, Device: id, DeviceName: d.Name, Application: app.Name}
+			domains[key] = &homeDomain{Host: host, Device: id, DeviceName: d.Name, Application: app.Name, ApplicationID: app.ID, Description: app.Description}
 		}
 		domains[key].homeUsage.add(up, down)
 		if selected != "" {
@@ -704,7 +780,10 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 		out.Applications = append(out.Applications, *app)
 	}
 	for _, domain := range domains {
-		out.Domains = append(out.Domains, *domain)
+		if query.Application == "" || domain.ApplicationID == query.Application {
+			out.Domains = append(out.Domains, *domain)
+			out.DomainUsage.add(domain.Upload, domain.Download)
+		}
 	}
 	for _, point := range points {
 		out.Timeline = append(out.Timeline, *point)
@@ -716,10 +795,23 @@ func (h *homeMonitor) summary(start, end int64, selected string) (homeSummary, e
 		return out.Devices[i].Total > out.Devices[j].Total
 	})
 	sort.Slice(out.Applications, func(i, j int) bool { return out.Applications[i].Total > out.Applications[j].Total })
-	sort.Slice(out.Domains, func(i, j int) bool { return out.Domains[i].Total > out.Domains[j].Total })
-	if len(out.Domains) > 200 {
-		out.Domains = out.Domains[:200]
-	}
+	sort.Slice(out.Domains, func(i, j int) bool {
+		a, b := out.Domains[i], out.Domains[j]
+		if a.Total != b.Total {
+			return a.Total > b.Total
+		}
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Device != b.Device {
+			return a.Device < b.Device
+		}
+		return a.ApplicationID < b.ApplicationID
+	})
+	out.DomainCount = len(out.Domains)
+	first := min(query.Offset, len(out.Domains))
+	last := first + min(query.Limit, len(out.Domains)-first)
+	out.Domains = out.Domains[first:last]
 	sort.Slice(out.Timeline, func(i, j int) bool { return out.Timeline[i].Timestamp < out.Timeline[j].Timestamp })
 	return out, nil
 }
@@ -739,7 +831,18 @@ func (s *service) homeRoutes() http.Handler {
 				writeError(w, http.StatusBadRequest, errors.New("请选择不超过 90 天的有效时间范围"))
 				return
 			}
-			data, err := s.home.summary(start, end, r.URL.Query().Get("device"))
+			query := homeDomainQuery{Application: r.URL.Query().Get("application"), Limit: 100}
+			if raw := r.URL.Query().Get("offset"); raw != "" {
+				query.Offset, err = strconv.Atoi(raw)
+			}
+			if err == nil && r.URL.Query().Get("limit") != "" {
+				query.Limit, err = strconv.Atoi(r.URL.Query().Get("limit"))
+			}
+			if err != nil || query.Offset < 0 || query.Limit < 1 || query.Limit > 200 {
+				writeError(w, http.StatusBadRequest, errors.New("offset 必须为非负整数，limit 必须介于 1–200"))
+				return
+			}
+			data, err := s.home.summaryPage(start, end, r.URL.Query().Get("device"), query)
 			if err != nil {
 				log.Printf("home summary: %v", err)
 				writeError(w, http.StatusInternalServerError, errors.New("暂时无法读取统计"))

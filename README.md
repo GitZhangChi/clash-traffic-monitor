@@ -5,7 +5,10 @@
 通过设置 `TRAFFIC_MONITOR_HOME_CONFIG` 启用独立的只读全屋页面。它读取 sing-box 的 Clash API，按设备、应用/服务和日期展示用量；原有运行方式继续使用原来的页面。
 
 - 从路由器 DHCP 租约和邻居表取得设备名称，以 MAC 合并 IPv4/IPv6，并保存地址归属变化。
-- 内置 45 类服务的域名规则，来源版本记录在 `home-applications.json`；私人 Emby 等服务在私有配置里添加。
+- 内置 51 类服务和基础设施的规则，包含 DeepSeek、番茄小说、加密 DNS 和 Telegram 官方 IP 段；来源版本记录在 `home-applications.json`。私人服务在私有配置里添加。
+- 同一设备、目标和服务分别计量；应用筛选在分页前执行，每页默认 100 条，可查询全部明细。页面每页显示 50 条。
+- 单列未识别服务和未采样到连接明细的用量；共享云存储等基础设施明确标为“应用待确认”。
+- 默认折叠所选时段零用量的设备，可勾选展开；私有配置支持设备命名和有时间范围的已核验地址补录。
 - 采集器首次启动及核心计数重置时建立基线，避免重放已有长连接的累计流量。
 - 全屋总量取核心计数增量。连接采样来不及归属的短连接仍计入总量，并单列未归属用量。
 - SQLite 保存近 30 天数据，可通过 `retentionDays` 调整至 1–365 天。关闭浏览器不影响采集。
@@ -29,11 +32,19 @@ uv run scripts/home-runtime.py \
 更新内置服务目录时，先取得指定的 `v2fly/domain-list-community` 版本，再运行：
 
 ```sh
-uv run scripts/build-home-catalog.py --source /path/to/domain-list-community --output home-applications.json
+uv run scripts/build-home-catalog.py --source /path/to/domain-list-community --revision <commit> --output home-applications.json
 go test ./...
 ```
 
 来源采用 MIT 许可，随二进制保留 `THIRD_PARTY_LICENSES/domain-list-community.txt`。浏览器检查入口为 `scripts/verify-home-ui.py`，检查真实采集、登录、设备合并、筛选和手机布局。
+
+私有配置中的 `applications` 可使用 `domains`（完整域名或裸 IP）、`suffixes`、`keywords`、`regex`、`ruleSets`、`ipCIDRs` 和说明文字 `description`。域名和已命中的服务规则优先于 IP 段；IP 段按最长前缀匹配。服务端使用应用 ID 筛选，域名明细包含 `applicationId`；同一目标可能因不同规则而有多行，逐行求和与相应应用合计一致。
+
+`deviceNames` 使用规范的小写 MAC 作为键。`addressBindings` 仅用于补录已经核验的历史地址，字段为 `address`、`device`（MAC 或 `router`）、`from` 和 `to`（Unix 毫秒，左闭右开）。时间范围必须有限且不重叠；路由器实际观察到的归属始终优先。不要根据当前地址猜测任意历史归属。
+
+只读接口 `/api/home/summary` 接受 `start`、`end`、可选 `device`、`application`、`offset`（默认 0）和 `limit`（默认 100，1–200）。`domainCount` 为筛选后的完整行数，`domainUsage` 为分页前的用量合计；筛选域名不改变设备、趋势或总用量的统计范围。
+
+浏览器回归使用 `uv run --with playwright scripts/verify-home-ui.py --url <监控地址> --config <私有配置> --artifacts <私有截图目录>`；可用 `--browser-executable` 指定现有 Chromium。检查使用实际保留的历史记录，无需清空数据库。
 
 `Traffic Monitor` 是一个独立运行的 Clash 流量监控服务。
 
