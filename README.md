@@ -1,5 +1,40 @@
 # Traffic Monitor
 
+## 全屋流量监控模式（当前分支）
+
+通过设置 `TRAFFIC_MONITOR_HOME_CONFIG` 启用独立的只读全屋页面。它读取 sing-box 的 Clash API，按设备、应用/服务和日期展示用量；原有运行方式继续使用原来的页面。
+
+- 从路由器 DHCP 租约和邻居表取得设备名称，以 MAC 合并 IPv4/IPv6，并保存地址归属变化。
+- 内置 45 类服务的域名规则，来源版本记录在 `home-applications.json`；私人 Emby 等服务在私有配置里添加。
+- 采集器首次启动及核心计数重置时建立基线，避免重放已有长连接的累计流量。
+- 全屋总量取核心计数增量。连接采样来不及归属的短连接仍计入总量，并单列未归属用量。
+- SQLite 保存近 30 天数据，可通过 `retentionDays` 调整至 1–365 天。关闭浏览器不影响采集。
+- 全屋页面提供登录和只读查询，不暴露原版的节点切换、密钥设置或删除接口。
+
+构建后，将 `home.example.json` 另存到权限受限的私有运行目录，填写路由器 SSH 别名和通过实机核验的 `expectedHostname`。不要将包含私人服务器、设备资料或凭据的实际配置加入 Git。
+
+```sh
+go build -o /path/to/private-runtime/home-traffic-monitor .
+uv run scripts/home-runtime.py \
+  --config /path/to/private-runtime/home.json \
+  --binary /path/to/private-runtime/home-traffic-monitor \
+  --runtime-dir /path/to/private-runtime \
+  --listen 192.168.8.100:11225
+```
+
+启动器通过 SSH 实时读取核心 API 地址及密钥，核对路由器主机名后启动采集；不依赖 zashboard 或其他前端。登录使用现有 sing-box API Secret，也可通过 `TRAFFIC_MONITOR_ACCESS_TOKEN` 单独配置访问密钥。局域网监听必须启用认证。若修改了核心 API 的地址或密钥，重启采集器以重新读取。
+
+统计范围为核心接管的直连及代理流量。局域网互传、绕过核心的流量不包含在内。应用分类表示服务归属，同一服务的 App 和网页会合并；设备自己建立的加密代理/VPN 内部应用无法由路由器识别。私人 Emby 入口和实际视频域名应分别核验，不能仅凭同时出现便判定它们属于同一次播放。历史仅从首次采集后开始累积。
+
+更新内置服务目录时，先取得指定的 `v2fly/domain-list-community` 版本，再运行：
+
+```sh
+uv run scripts/build-home-catalog.py --source /path/to/domain-list-community --output home-applications.json
+go test ./...
+```
+
+来源采用 MIT 许可，随二进制保留 `THIRD_PARTY_LICENSES/domain-list-community.txt`。浏览器检查入口为 `scripts/verify-home-ui.py`，检查真实采集、登录、设备合并、筛选和手机布局。
+
 `Traffic Monitor` 是一个独立运行的 Clash 流量监控服务。
 
 它会定时读取 Clash 的 `/connections` 数据，把流量增量先聚合到内存，再按分钟桶批量写入 SQLite，并提供一个内置 Web 页面，用来查看设备、域名、IP、代理维度的流量统计和链路明细。

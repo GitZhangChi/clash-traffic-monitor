@@ -14,3 +14,4 @@ __debug*
 CLAUDE.md
 release/
 vendor/
+__pycache__/

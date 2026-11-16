@@ -1,0 +1,12 @@
+{
+  "routerSSH": "mt6000-lan",
+  "expectedHostname": "your-router-hostname",
+  "retentionDays": 30,
+  "applications": [
+    {
+      "id": "private-emby",
+      "name": "私人 Emby",
+      "domains": ["emby.example.com"]
+    }
+  ]
+}

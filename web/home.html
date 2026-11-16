@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>全屋流量 · MT6000</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/home.css">
+  <script src="/home.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="header">
+      <div><p class="eyebrow">HOME NETWORK / MT6000</p><h1>全屋流量<span class="live" id="status">正在连接</span></h1><p class="subtitle" id="collectionSince">正在读取采集状态</p></div>
+      <button class="button secondary" id="refresh" type="button">刷新</button>
+    </header>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <section class="toolbar" aria-label="统计范围">
+      <div class="scope"><button id="allDevices" class="scope-button" type="button">全屋设备</button><span id="selectedName"></span></div>
+      <div class="ranges" role="group" aria-label="时间范围">
+        <button type="button" data-range="hour">近 1 小时</button><button type="button" data-range="today" class="active">今天</button><button type="button" data-range="yesterday">昨天</button><button type="button" data-range="week">近 7 天</button><button type="button" data-range="custom">自选日期</button>
+      </div>
+      <form id="customRange" hidden><label>开始 <input id="startDate" type="date" required></label><label>结束 <input id="endDate" type="date" required></label><button class="button" type="submit">查看</button></form>
+    </section>
+    <section class="metrics" aria-label="用量概览">
+      <article class="metric"><span class="metric-label">总用量</span><strong id="total">—</strong><span class="metric-detail" id="totalDetail">上传 + 下载</span></article>
+      <article class="metric"><span class="metric-label"><i class="dot blue"></i>下载</span><strong id="download">—</strong><span class="metric-detail" id="downloadDetail">所选时间内</span></article>
+      <article class="metric"><span class="metric-label"><i class="dot amber"></i>上传</span><strong id="upload">—</strong><span class="metric-detail" id="uploadDetail">所选时间内</span></article>
+      <article class="metric"><span class="metric-label">全屋有流量的设备</span><strong id="activeCount">—</strong><span class="metric-detail" id="inventoryCount">设备信息更新中</span></article>
+    </section>
+    <section class="panel trend-panel">
+      <div class="panel-heading"><div><h2>流量趋势</h2><p id="chartCaption">采集后逐步积累</p></div><div class="legend"><span><i class="dot blue"></i>下载</span><span><i class="dot amber"></i>上传</span></div></div>
+      <div id="chart" class="chart" role="img" aria-label="所选时间范围内的上传下载流量趋势"></div>
+      <div class="chart-labels"><span id="chartStart">—</span><span id="chartMiddle">—</span><span id="chartEnd">—</span></div>
+    </section>
+    <div class="columns">
+      <section class="panel devices-panel">
+        <div class="panel-heading"><div><h2>设备用量</h2><p>点选设备，查看它使用的服务</p></div><span id="deviceBadge" class="badge">—</span></div>
+        <div class="table-wrap"><table><thead><tr><th>设备</th><th>下载 / 上传</th><th>总用量</th></tr></thead><tbody id="devices"><tr><td colspan="3" class="empty">正在读取设备</td></tr></tbody></table></div>
+      </section>
+      <section class="panel apps-panel">
+        <div class="panel-heading"><div><h2>应用 / 服务</h2><p>按目标域名与规则分类，可点选查看域名</p></div><span id="applicationBadge" class="badge">—</span></div>
+        <div id="applications" class="applications"><p class="empty">等待采集</p></div>
+      </section>
+    </div>
+    <section class="panel domains-panel">
+      <div class="panel-heading"><div><h2 id="domainTitle">目标域名</h2><p>保留原始域名，便于核对服务分类</p></div><button id="clearApp" class="button secondary" type="button" hidden>清除服务筛选</button></div>
+      <div class="table-wrap"><table><thead><tr><th>域名</th><th>设备</th><th>服务</th><th>总用量</th></tr></thead><tbody id="domains"><tr><td colspan="4" class="empty">正在读取域名</td></tr></tbody></table></div>
+    </section>
+    <footer><p id="coverage">统计正在初始化。</p><p>应用分类为估算：同一服务的 App 和网页版会合并；设备自建代理 / VPN 只能识别到隧道。关闭页面后仍继续采集，历史从开始采集时累积。</p><p class="attribution">基于 <a href="https://github.com/zhf883680/clash-traffic-monitor" target="_blank" rel="noreferrer">clash-traffic-monitor</a> · 服务规则来源于 <a href="https://github.com/v2fly/domain-list-community" target="_blank" rel="noreferrer">domain-list-community</a></p></footer>
+  </main>
+</body>
+</html>

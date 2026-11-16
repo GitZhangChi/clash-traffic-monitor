@@ -23,7 +23,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-//go:embed LICENSE web/*
+//go:embed LICENSE web/* THIRD_PARTY_LICENSES/*
 var webAssets embed.FS
 
 const (
@@ -53,6 +53,7 @@ type config struct {
 	ListenAddr   string
 	MihomoURL    string
 	MihomoSecret string
+	HomeConfig   string
 }
 
 type mihomoSettings struct {
@@ -181,6 +182,7 @@ type mihomoProxiesResponse struct {
 
 type service struct {
 	db                     *sql.DB
+	home                   *homeMonitor
 	client                 *http.Client
 	now                    func() time.Time
 	cfg                    config
@@ -291,6 +293,13 @@ func newApplication(cfg config, dbPath string) (*application, error) {
 		aggregateBuffer:        make(map[string]*aggregatedEntry),
 		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
 	}
+	if cfg.HomeConfig != "" {
+		svc.home, err = newHomeMonitor(db, cfg)
+		if err != nil {
+			listener.Close()
+			return closeDBOnError(fmt.Errorf("initialize home monitoring: %w", err))
+		}
+	}
 
 	app.svc = svc
 	app.listener = listener
@@ -378,6 +387,7 @@ func loadConfig() (config, error) {
 		ListenAddr:   getenv("TRAFFIC_MONITOR_LISTEN", defaultListenAddr),
 		MihomoURL:    strings.TrimRight(getenv("MIHOMO_URL", ""), "/"),
 		MihomoSecret: getenv("MIHOMO_SECRET", ""),
+		HomeConfig:   getenv("TRAFFIC_MONITOR_HOME_CONFIG", ""),
 	}
 
 	return cfg, nil
@@ -1253,6 +1263,15 @@ func backfillSummary(db *sql.DB, beforeMS int64) error {
 }
 
 func (s *service) runCollector(ctx context.Context) {
+	if s.home != nil {
+		inventoryDone := make(chan struct{})
+		s.home.refreshInventory(ctx)
+		go func() {
+			defer close(inventoryDone)
+			s.home.runInventory(ctx)
+		}()
+		defer func() { <-inventoryDone }()
+	}
 	s.collectOnce(ctx)
 
 	ticker := time.NewTicker(defaultPollInterval)
@@ -1277,6 +1296,9 @@ func (s *service) collectOnce(ctx context.Context) {
 	resp, err := s.fetchConnections(ctx, settings)
 	if err != nil {
 		log.Printf("poll Mihomo connections: %v", err)
+		if s.home != nil {
+			s.home.setCollectionError(err)
+		}
 		return
 	}
 
@@ -1408,6 +1430,9 @@ func (s *service) currentTime() time.Time {
 }
 
 func (s *service) processConnections(ctx context.Context, payload *connectionsResponse) error {
+	if s.home != nil {
+		return s.processHomeConnections(payload)
+	}
 	now := s.currentTime()
 	nowMS := now.UnixMilli()
 
@@ -2211,6 +2236,9 @@ func (s *service) snapshotAggregateEntries(shouldFlush func(*aggregatedEntry) bo
 }
 
 func (s *service) routes() http.Handler {
+	if s.home != nil {
+		return s.homeRoutes()
+	}
 	mux := http.NewServeMux()
 	staticFS, err := fs.Sub(webAssets, "web")
 	if err != nil {
