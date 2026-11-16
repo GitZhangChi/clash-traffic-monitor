@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise the real local home dashboard in desktop and mobile Chromium."""
+"""Exercise a running home dashboard against its actual retained data."""
 import argparse
 import json
-import time
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -18,6 +17,7 @@ def main():
     parser.add_argument("--browser-executable", type=Path)
     args = parser.parse_args()
     args.artifacts.mkdir(parents=True, exist_ok=True)
+    args.artifacts.chmod(0o700)
     secret = load_runtime_settings(args.config)["secret"]
     errors = []
     with sync_playwright() as p:
@@ -29,48 +29,74 @@ def main():
         page = context.new_page()
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.goto(args.url, wait_until="networkidle")
-        expect(page.locator("h1")).to_have_text("全屋流量")
         page.locator("#token").fill(secret)
         page.get_by_role("button", name="进入监控").click()
-        page.wait_for_load_state("networkidle")
-        page.wait_for_function("document.getElementById('status').textContent === '正在采集'")
-        page.wait_for_function("document.querySelectorAll('#devices .device-button').length > 0")
-        now = int(time.time() * 1000)
-        query = urlencode({"start": now - 120000, "end": now + 60000})
-        response = context.request.get(args.url + "/api/home/summary?" + query)
-        assert response.ok
-        data = response.json()
+        page.wait_for_function("document.body.dataset.renderedRequest")
+        expect(page.locator("#status")).to_have_text("正在采集")
+
+        def act(action):
+            before = int(page.locator("body").get_attribute("data-rendered-request"))
+            action()
+            page.wait_for_function("before => Number(document.body.dataset.renderedRequest) > before", arg=before)
+
+        def summary(**params):
+            data = page.evaluate("({start:state.data.start,end:state.data.end,device:state.device})")
+            data.update(params)
+            response = context.request.get(args.url + "/api/home/summary?" + urlencode(data))
+            assert response.ok, response.status
+            return response.json()
+
+        data = summary()
         assert data["lastInventory"] > 0
-        merged = [d for d in data["devices"] if any(":" not in a for a in d["addresses"]) and any(":" in a and not a.startswith("fe80:") for a in d["addresses"])]
-        assert merged, "No IPv4/IPv6 device merge was observed"
-        apple_tv = next((d for d in data["devices"] if "apple-tv" in d["name"].lower()), None)
-        assert apple_tv, "Apple TV from the known household inventory is missing"
-        page.get_by_role("button", name=apple_tv["name"], exact=True).click()
-        expect(page.locator("#selectedName")).to_contain_text(apple_tv["name"])
+        merged = [d for d in data["devices"] if d.get("mac") and any(":" not in a for a in d["addresses"]) and any(":" in a and not a.startswith("fe80:") for a in d["addresses"])]
+        assert merged, "No IPv4/IPv6 device merge observed"
+        visible = next(d for d in data["devices"] if d.get("mac") and d["total"] > 0)
+        act(lambda: page.get_by_role("button", name=visible["name"], exact=True).click())
+        expect(page.locator("#selectedName")).to_contain_text(visible["name"])
         expect(page.locator("#totalDetail")).to_have_text("设备用量按连接采样统计")
-        page.get_by_role("button", name="全屋设备", exact=True).click()
+        act(lambda: page.get_by_role("button", name="全屋设备", exact=True).click())
         expect(page.locator("#selectedName")).to_have_text("")
-        page.get_by_role("button", name="昨天", exact=True).click()
-        page.wait_for_load_state("networkidle")
-        expect(page.locator("#total")).to_have_text("0 B")
-        page.get_by_role("button", name="近 1 小时", exact=True).click()
-        page.wait_for_function("document.querySelectorAll('#applications .app-button').length > 0", timeout=30000)
-        page.locator("#applications .app-button").first.click()
-        expect(page.locator("#clearApp")).to_be_visible()
-        page.locator("#clearApp").click()
-        expect(page.locator("#clearApp")).to_be_hidden()
+
+        act(lambda: page.get_by_role("button", name="昨天", exact=True).click())
+        yesterday = summary()
+        shown = page.evaluate("state.data.totals.total")
+        assert shown == yesterday["totals"]["total"], "Historical page differs from retained data"
+        act(lambda: page.get_by_role("button", name="今天", exact=True).click())
+        data = summary()
+        for app in sorted(data["applications"], key=lambda a: a["total"])[:1] + [a for a in data["applications"] if a["id"] == "telegram"]:
+            act(lambda: page.locator(f'[data-application="{app["id"]}"]').click())
+            filtered = summary(application=app["id"], limit=50)
+            assert filtered["domainCount"] > 0, f"No details for {app['id']}"
+            current_app = next(a for a in filtered["applications"] if a["id"] == app["id"])
+            assert filtered["domainUsage"]["total"] == current_app["total"], "Domain/application totals differ"
+            assert all(d["applicationId"] == app["id"] for d in filtered["domains"])
+            expect(page.locator("#domains .empty")).to_have_count(0)
+            act(lambda: page.locator("#clearApp").click())
+
+        if data["domainCount"] > 50:
+            act(lambda: page.locator("#domainNext").click())
+            assert page.evaluate("state.data.domainOffset") == 50
+            act(lambda: page.locator("#domainPrevious").click())
+            assert page.evaluate("state.data.domainOffset") == 0
+        zero = sum(d["total"] == 0 for d in data["devices"])
+        before = page.locator("#devices .device-button").count()
+        page.locator("#showInactive").check()
+        assert page.locator("#devices .device-button").count() == before + zero
+        page.locator("#showInactive").uncheck()
+        page.locator(".applications").evaluate("e => e.scrollTop = 0")
+        page.evaluate("window.scrollTo(0, 0)")
         page.screenshot(path=str(args.artifacts / "desktop.png"), full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
-        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Mobile page overflows horizontally"
-        assert page.locator(".devices-panel .table-wrap").evaluate("element => element.scrollWidth <= element.clientWidth"), "Mobile device usage columns are clipped"
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), "Mobile page overflows"
+        assert page.locator(".devices-panel .table-wrap").evaluate("e => e.scrollWidth <= e.clientWidth"), "Device columns clipped"
+        assert page.locator(".domains-panel .table-wrap").evaluate("e => e.scrollWidth <= e.clientWidth"), "Domain columns clipped"
         page.screenshot(path=str(args.artifacts / "mobile.png"), full_page=True)
-        page.locator(".apps-panel").scroll_into_view_if_needed()
-        page.screenshot(path=str(args.artifacts / "mobile-services.png"))
+        page.locator(".domains-panel").scroll_into_view_if_needed()
+        page.screenshot(path=str(args.artifacts / "mobile-domains.png"))
         assert not errors, errors
-        final = context.request.get(args.url + "/api/home/summary?" + query).json()
-        report = {"ok": True, "devices": len([d for d in final["devices"] if d.get("mac")]), "mergedDevices": len([d for d in merged if d.get("mac")]),
-                  "services": len(final["applications"]), "observedBytes": final["totals"]["total"],
-                  "checks": ["login", "live collection", "IPv4/IPv6 merge", "Apple TV drilldown", "historical range", "service filter", "mobile layout"],
+        report = {"ok": True, "devices": len([d for d in data["devices"] if d.get("mac")]), "mergedDevices": len(merged),
+                  "services": len(data["applications"]), "domainCount": data["domainCount"], "yesterdayBytes": yesterday["totals"]["total"],
+                  "checks": ["login", "live collection", "IPv4/IPv6 merge", "device drilldown", "retained history", "small-service details", "Telegram totals", "pagination", "zero-usage toggle", "mobile layout"],
                   "pageErrors": errors}
         (args.artifacts / "verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         print(json.dumps(report, ensure_ascii=False))

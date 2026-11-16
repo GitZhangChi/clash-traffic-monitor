@@ -29,6 +29,7 @@
       <article class="metric"><span class="metric-label"><i class="dot amber"></i>上传</span><strong id="upload">—</strong><span class="metric-detail" id="uploadDetail">所选时间内</span></article>
       <article class="metric"><span class="metric-label">全屋有流量的设备</span><strong id="activeCount">—</strong><span class="metric-detail" id="inventoryCount">设备信息更新中</span></article>
     </section>
+    <p id="classification" class="classification" aria-live="polite"></p>
     <section class="panel trend-panel">
       <div class="panel-heading"><div><h2>流量趋势</h2><p id="chartCaption">采集后逐步积累</p></div><div class="legend"><span><i class="dot blue"></i>下载</span><span><i class="dot amber"></i>上传</span></div></div>
       <div id="chart" class="chart" role="img" aria-label="所选时间范围内的上传下载流量趋势"></div>
@@ -37,6 +38,7 @@
     <div class="columns">
       <section class="panel devices-panel">
         <div class="panel-heading"><div><h2>设备用量</h2><p>点选设备，查看它使用的服务</p></div><span id="deviceBadge" class="badge">—</span></div>
+        <label class="device-filter"><input id="showInactive" type="checkbox">显示零用量设备（<span id="inactiveCount">0</span>）</label>
         <div class="table-wrap"><table><thead><tr><th>设备</th><th>下载 / 上传</th><th>总用量</th></tr></thead><tbody id="devices"><tr><td colspan="3" class="empty">正在读取设备</td></tr></tbody></table></div>
       </section>
       <section class="panel apps-panel">
@@ -47,6 +49,7 @@
     <section class="panel domains-panel">
       <div class="panel-heading"><div><h2 id="domainTitle">目标域名</h2><p>保留原始域名，便于核对服务分类</p></div><button id="clearApp" class="button secondary" type="button" hidden>清除服务筛选</button></div>
       <div class="table-wrap"><table><thead><tr><th>域名</th><th>设备</th><th>服务</th><th>总用量</th></tr></thead><tbody id="domains"><tr><td colspan="4" class="empty">正在读取域名</td></tr></tbody></table></div>
+      <div class="domain-pagination"><span id="domainPage" aria-live="polite"></span><div><button id="domainPrevious" class="button secondary" type="button" disabled>上一页</button><button id="domainNext" class="button secondary" type="button" disabled>下一页</button></div></div>
     </section>
     <footer><p id="coverage">统计正在初始化。</p><p>应用分类为估算：同一服务的 App 和网页版会合并；设备自建代理 / VPN 只能识别到隧道。关闭页面后仍继续采集，历史从开始采集时累积。</p><p class="attribution">基于 <a href="https://github.com/zhf883680/clash-traffic-monitor" target="_blank" rel="noreferrer">clash-traffic-monitor</a> · 服务规则来源于 <a href="https://github.com/v2fly/domain-list-community" target="_blank" rel="noreferrer">domain-list-community</a></p></footer>
   </main>
